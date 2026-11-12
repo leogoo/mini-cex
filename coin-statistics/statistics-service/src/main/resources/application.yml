@@ -1,0 +1,10 @@
+server:
+  port: 8102
+
+spring:
+  application:
+    name: statistics-service
+  cloud:
+    nacos:
+      discovery:
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}

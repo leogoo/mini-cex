@@ -1,0 +1,265 @@
+# ============================================================
+#  CEX 交易所基础中间件全家桶
+#  MySQL / Redis / RocketMQ(NameServer + Broker + 控制台)
+#  MongoDB / Nacos / Sentinel / Seata / YApi(mongo-yapi + yapi)
+#  统一编排：docker compose up -d
+# ============================================================
+
+services:
+
+  # ---------------- MySQL ----------------
+  mysql:
+    image: mysql:8.0
+    container_name: cex-mysql
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: root123456      # root 密码
+      MYSQL_DATABASE: coin_exchange        # 初始化库
+      MYSQL_USER: cex                      # 业务账号
+      MYSQL_PASSWORD: cex123456
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql          # 数据持久化
+    networks:
+      - cex-net
+
+  # ---------------- Redis ----------------
+  redis:
+    image: redis:7.2
+    container_name: cex-redis
+    restart: always
+    command: redis-server --requirepass redis123456 --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data                   # 开启 AOF 持久化
+    networks:
+      - cex-net
+
+  # ---------------- RocketMQ 卷权限初始化（一次性任务） ----------------
+  # 踩坑：Docker 新建的命名卷属主是 root，而 apache/rocketmq 镜像以 uid=3000(rocketmq) 运行，
+  # 导致 broker 写 store 时 Permission denied，initialize() 返回 false，容器 exit 255 无限重启
+  # （日志里只看到一个被掩盖的 NullPointerException，很容易误判成架构不兼容）。
+  # 这里用一次性容器把卷属主改成 3000，namesrv/broker 等它执行完成后再启动。
+  rocketmq-init:
+    # 只用 chown，不需要 Java 环境；用 alpine 多架构镜像可原生运行（arm64 无需模拟）
+    image: alpine:3.19
+    container_name: cex-rocketmq-init
+    user: root                      # 只有 root 才能 chown
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    # 注意：必须用列表形式包成「单个参数」，直接写字符串会被额外拆词导致 chown 丢参数
+    command: ["chown -R 3000:3000 /mnt && echo 'rocketmq volumes permission fixed'"]
+    volumes:
+      - namesrv_logs:/mnt/namesrv_logs
+      - namesrv_store:/mnt/namesrv_store
+      - broker_logs:/mnt/broker_logs
+      - broker_store:/mnt/broker_store
+    networks:
+      - cex-net
+
+  # ---------------- RocketMQ NameServer ----------------
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.3.0
+    platform: linux/amd64          # Apple Silicon(M1/M2/M3) 需模拟运行，显式指定消除架构不匹配告警
+    container_name: cex-rocketmq-namesrv
+    restart: always
+    environment:
+      # 降低 JVM 内存占用，适合本机开发
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+    ports:
+      - "9876:9876"
+    volumes:
+      - namesrv_logs:/home/rocketmq/logs
+      - namesrv_store:/home/rocketmq/store
+    command: sh mqnamesrv
+    depends_on:
+      rocketmq-init:
+        condition: service_completed_successfully
+    networks:
+      - cex-net
+
+  # ---------------- RocketMQ Broker ----------------
+  rocketmq-broker:
+    image: apache/rocketmq:5.3.0
+    platform: linux/amd64          # Apple Silicon 模拟运行
+    container_name: cex-rocketmq-broker
+    restart: always
+    environment:
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      NAMESRV_ADDR: "rocketmq-namesrv:9876"
+    ports:
+      - "10909:10909"   # VIP 通道
+      - "10911:10911"   # 业务通道（Spring 客户端连这个）
+      - "10912:10912"   # HA 通道
+    volumes:
+      - broker_logs:/home/rocketmq/logs
+      - broker_store:/home/rocketmq/store
+      - ./rocketmq/broker.conf:/opt/rocketmq/broker.conf:ro
+    command: sh mqbroker -c /opt/rocketmq/broker.conf
+    depends_on:
+      rocketmq-init:
+        condition: service_completed_successfully
+      rocketmq-namesrv:
+        condition: service_started
+    extra_hosts:
+      # 让容器内可解析宿主机，配合 broker.conf 里的 brokerIP1
+      - "host.docker.internal:host-gateway"
+    networks:
+      - cex-net
+
+  # ---------------- RocketMQ 控制台 ----------------
+  # 原 rocketmq-console-ng，官方已更名为 rocketmq-dashboard
+  rocketmq-dashboard:
+    image: apacherocketmq/rocketmq-dashboard:latest
+    platform: linux/amd64          # Apple Silicon 模拟运行
+    container_name: cex-rocketmq-dashboard
+    restart: always
+    environment:
+      # 该 latest(2.1.1) 镜像内置 server.port=8082，需显式改回 8080，
+      # 否则容器监听 8082、宿主 8080 映射落空，浏览器打不开（curl 报 000/56）。
+      JAVA_OPTS: "-Drocketmq.namesrv.addr=rocketmq-namesrv:9876 -Dserver.port=8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - rocketmq-namesrv
+    networks:
+      - cex-net
+
+  # ---------------- MongoDB ----------------
+  mongodb:
+    image: mongo:7.0
+    container_name: cex-mongodb
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root123456
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - cex-net
+
+  # ---------------- Nacos（注册中心 / 配置中心） ----------------
+  # 单机模式 + 内置 Derby 存储，适合本地学习；生产请切 MySQL 持久化
+  nacos:
+    image: nacos/nacos-server:v2.4.3
+    container_name: cex-nacos
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      MODE: standalone              # 单机模式
+      PREFER_HOST_MODE: hostname
+      JVM_XMS: 256m
+      JVM_XMX: 256m
+      JVM_XMN: 128m
+    ports:
+      - "8848:8848"   # 主端口（OpenAPI / 控制台）
+      - "9848:9848"   # gRPC 客户端端口（Nacos 2.x 必须映射，否则 Java 客户端连不上）
+      - "9849:9849"   # gRPC 服务端端口
+    volumes:
+      - nacos_data:/home/nacos/data
+      - nacos_logs:/home/nacos/logs
+    networks:
+      - cex-net
+
+  # ---------------- Sentinel（熔断 / 限流控制台） ----------------
+  sentinel:
+    image: bladex/sentinel-dashboard:1.8.7
+    container_name: cex-sentinel
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_OPTS: "-Dserver.port=8080"
+    ports:
+      - "8081:8080"   # 容器默认 8080 → 宿主机 8081（避免与 rocketmq-dashboard 的 8080 冲突）
+    networks:
+      - cex-net
+
+  # ---------------- Seata（分布式事务协调） ----------------
+  # file 存储模式（单机学习用），生产请切 db 模式并配 registry
+  seata:
+    image: seataio/seata-server:1.8.0
+    container_name: cex-seata
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      SEATA_PORT: 8091
+      STORE_MODE: file
+    ports:
+      - "8091:8091"   # 事务协调通信端口
+      - "7091:7091"   # 控制台端口（Seata 1.5+）
+    volumes:
+      - seata_data:/seata-server/sessionStore
+    networks:
+      - cex-net
+
+  # ---------------- YApi 专用 MongoDB ----------------
+  # 单独给 YApi 一份数据库，避免与上面通用 mongodb(27017) 互相污染。
+  # 注意：不映射宿主机端口，否则与已存在的 mongodb:27017 冲突；
+  #       YApi 通过内部网络 mongo-yapi:27017 访问即可。
+  mongo-yapi:
+    image: mongo:7.0
+    container_name: cex-mongo-yapi
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - mongo_yapi_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cex-net
+
+  # ---------------- YApi（API 接口管理平台 / 文档中心） ----------------
+  # 应用镜像 jayfong/yapi 是社区镜像，但 daocloud 已代理，可正常拉取。
+  # 注意：必须用镜像默认启动（node /yapi/vendors/start.js），它会读取下方
+  #       YAPI_* 环境变量、首次自动初始化数据库(建管理员账号)并启动服务；
+  #       若自行覆盖 command（如 "yapi serverapp"）会因入口脚本逻辑而报
+  #       "Cannot find module '/yapi/yapi'"，切勿添加 command 覆盖。
+  yapi:
+    image: jayfong/yapi:latest
+    container_name: cex-yapi
+    restart: always
+    ports:
+      - "3000:3000"   # 管理后台
+    environment:
+      TZ: Asia/Shanghai
+      YAPI_ADMIN_ACCOUNT: admin@cex.com
+      YAPI_ADMIN_PASSWORD: yapi123456
+      YAPI_CLOSE_REGISTER: "true"        # 关闭公开注册，仅管理员创建账号
+      YAPI_DB_SERVERNAME: mongo-yapi     # 连上面的专用 mongo（服务名解析）；注意是 SERVERNAME 不是 SERVER_HOST
+      YAPI_DB_PORT: "27017"
+      YAPI_DB_DATABASE: yapi
+    depends_on:
+      mongo-yapi:
+        condition: service_healthy      # 等 mongo 真正可连后再启动，避免初始化失败
+    networks:
+      - cex-net
+
+volumes:
+  mysql_data:
+  redis_data:
+  namesrv_logs:
+  namesrv_store:
+  broker_logs:
+  broker_store:
+  mongo_data:
+  nacos_data:
+  nacos_logs:
+  seata_data:
+  mongo_yapi_data:
+
+networks:
+  cex-net:
+    driver: bridge
